@@ -9,6 +9,7 @@ import streamlit as st
 import requests
 import re
 import urllib.parse
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from fuzzywuzzy import fuzz
@@ -19,6 +20,68 @@ from bs4 import BeautifulSoup
 # Configuration
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
+DB_PATH = Path(__file__).parent / "papers.db"
+
+
+# ============ Database Functions ============
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS papers (
+        id INTEGER PRIMARY KEY, title TEXT UNIQUE, authors TEXT, year TEXT,
+        venue TEXT, doi TEXT, citations INTEGER, citation_key TEXT, abbr TEXT,
+        bibtex TEXT, source TEXT, added_date TEXT)""")
+    conn.commit()
+    conn.close()
+
+def save_to_db(paper: dict, source: str = "sync") -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("""INSERT OR REPLACE INTO papers
+            (title,authors,year,venue,doi,citations,citation_key,abbr,bibtex,source,added_date)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (paper.get("title"), paper.get("authors"), paper.get("year"), paper.get("venue"),
+             paper.get("doi",""), paper.get("citations",0), paper.get("citation_key"),
+             paper.get("abbr"), paper.get("bibtex"), source, datetime.now().isoformat()))
+        conn.commit()
+        return True
+    except: return False
+    finally: conn.close()
+
+def search_db(query="", author="", year="", limit=200):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conds, params = [], []
+    if query: conds.append("(title LIKE ? OR venue LIKE ?)"); params += [f"%{query}%"]*2
+    if author: conds.append("authors LIKE ?"); params.append(f"%{author}%")
+    if year: conds.append("year=?"); params.append(year)
+    where = " AND ".join(conds) if conds else "1=1"
+    rows = conn.execute(f"SELECT * FROM papers WHERE {where} ORDER BY year DESC LIMIT ?", params+[limit]).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_db_years():
+    conn = sqlite3.connect(DB_PATH)
+    years = [r[0] for r in conn.execute("SELECT DISTINCT year FROM papers WHERE year!='' ORDER BY year DESC")]
+    conn.close()
+    return years
+
+def delete_from_db(pid):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM papers WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+
+def update_db_doi(pid, doi):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE papers SET doi=? WHERE id=?", (doi, pid))
+    conn.commit()
+    conn.close()
+
+def get_db_count():
+    conn = sqlite3.connect(DB_PATH)
+    cnt = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    conn.close()
+    return cnt
 
 
 # DOI Lookup and Verification Functions
@@ -757,8 +820,15 @@ def main():
     if "doi_lookup_enabled" not in st.session_state:
         st.session_state.doi_lookup_enabled = True
 
+    # Initialize database
+    init_db()
+
     # Sidebar configuration
     with st.sidebar:
+        st.header("Navigation")
+        page = st.radio("Page", ["🔄 Sync Papers", "📂 My Papers"], label_visibility="collapsed")
+
+        st.divider()
         st.header("Configuration")
 
         input_method = st.radio(
@@ -825,42 +895,190 @@ def main():
         st.session_state.bib_url = bib_url
         st.session_state.lm_studio_url = lm_studio_url
 
-    # Main content area
-    if st.session_state.step == 1:
-        input_method = st.session_state.get("input_method", "LM Studio (AI extraction)")
-        bib_url = st.session_state.get("bib_url", "")
-        lm_studio_url = st.session_state.get("lm_studio_url", "http://localhost:1234/v1")
+    # ============ MY PAPERS PAGE ============
+    if page == "📂 My Papers":
+        st.header("📂 My Papers Database")
+        c1, c2 = st.columns([3,1])
+        with c1: st.metric("Papers in Database", get_db_count())
+        with c2:
+            if st.button("🔄 Refresh"): st.rerun()
 
-        if input_method == "Google Scholar URL":
-            st.info("Enter a Google Scholar profile URL and paste the page HTML")
+        st.divider()
+        st.subheader("🔍 Search")
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1: sq = st.text_input("Title/Venue", placeholder="learning analytics...")
+        with sc2: sa = st.text_input("Author", placeholder="Saqr...")
+        with sc3: sy = st.selectbox("Year", ["All"] + get_db_years())
 
-            scholar_url = st.text_input(
-                "Google Scholar Profile URL",
-                value="https://scholar.google.com/citations?hl=en&user=U-O6R7YAAAAJ&view_op=list_works&sortby=pubdate",
-                help="Your Google Scholar profile URL"
-            )
+        results = search_db(sq, sa, sy if sy != "All" else "")
+        st.caption(f"Found {len(results)} papers")
 
-            st.warning("⚠️ Auto-fetch may be blocked by Google. Use the manual paste method below.")
+        if "db_sel" not in st.session_state: st.session_state.db_sel = set()
 
-            with st.expander("📋 How to copy your Scholar HTML (recommended)", expanded=True):
-                st.markdown(f"""
-                1. Open your [Google Scholar profile]({scholar_url}) in a browser
-                2. Scroll down to load all papers you want
-                3. Right-click → **View Page Source** (or Ctrl+U / Cmd+Option+U)
-                4. Select all (Ctrl+A / Cmd+A) and copy
-                5. Paste below
-                """)
+        ac1, ac2, ac3, ac4 = st.columns(4)
+        with ac1:
+            if st.button("☑️ Select All"): st.session_state.db_sel = {r["id"] for r in results}; st.rerun()
+        with ac2:
+            if st.button("⬜ Clear"): st.session_state.db_sel.clear(); st.rerun()
+        with ac3: st.caption(f"{len(st.session_state.db_sel)} selected")
+        with ac4:
+            if st.session_state.db_sel:
+                sel_papers = [r for r in results if r["id"] in st.session_state.db_sel]
+                bib_out = []
+                for p in sel_papers:
+                    if p.get("bibtex"): bib_out.append(p["bibtex"])
+                    else:
+                        key = p.get("citation_key") or generate_citation_key(p.get("authors",""), p.get("year",""))
+                        bib_out.append(format_bibtex_entry(p, key, p.get("abbr","Article"), p.get("doi","")))
+                st.download_button("📥 Export BibTeX", "\n\n".join(bib_out), f"papers_{datetime.now().strftime('%Y%m%d')}.bib")
 
-            html_input = st.text_area(
-                "Paste Google Scholar HTML here",
-                height=200,
-                placeholder="<!DOCTYPE html>...",
-                help="Paste the full page source HTML"
-            )
+        st.divider()
+        for paper in results:
+            pid = paper["id"]
+            sel = pid in st.session_state.db_sel
+            with st.expander(f"{'☑️' if sel else '⬜'} **{paper['title'][:60]}...** ({paper['year']})"):
+                if st.checkbox("Select", value=sel, key=f"s_{pid}"):
+                    st.session_state.db_sel.add(pid)
+                else:
+                    st.session_state.db_sel.discard(pid)
+                st.markdown(f"**Authors:** {paper['authors']}")
+                st.markdown(f"**Venue:** {paper['venue'] or 'N/A'}")
+                if paper.get("doi"): st.markdown(f"**DOI:** `{paper['doi']}`")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Extract from Pasted HTML", type="primary", disabled=not (html_input and bib_url)):
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    if st.button("🔍 DOI", key=f"d_{pid}"):
+                        res = lookup_doi(paper["title"], paper["authors"], paper["year"])
+                        if res["status"]=="found" and res["doi"]:
+                            update_db_doi(pid, res["doi"]); st.success(res["doi"]); st.rerun()
+                        else: st.warning("Not found")
+                with b2:
+                    if st.button("🤖 Dups", key=f"c_{pid}"):
+                        dups = [(p["title"][:40], compute_similarity_score(paper,p)[0])
+                                for p in search_db(limit=500) if p["id"]!=pid and compute_similarity_score(paper,p)[0]>=60]
+                        if dups: st.warning(f"{len(dups)} potential dups"); [st.write(f"- {t} ({s:.0f})") for t,s in sorted(dups,key=lambda x:-x[1])[:3]]
+                        else: st.success("No dups")
+                with b3:
+                    if st.button("🗑️ Del", key=f"x_{pid}"):
+                        delete_from_db(pid); st.session_state.db_sel.discard(pid); st.rerun()
+
+    # ============ SYNC PAPERS PAGE ============
+    elif page == "🔄 Sync Papers":
+        if st.session_state.step == 1:
+            input_method = st.session_state.get("input_method", "LM Studio (AI extraction)")
+            bib_url = st.session_state.get("bib_url", "")
+            lm_studio_url = st.session_state.get("lm_studio_url", "http://localhost:1234/v1")
+
+            if input_method == "Google Scholar URL":
+                st.info("Enter a Google Scholar profile URL and paste the page HTML")
+
+                scholar_url = st.text_input(
+                    "Google Scholar Profile URL",
+                    value="https://scholar.google.com/citations?hl=en&user=U-O6R7YAAAAJ&view_op=list_works&sortby=pubdate",
+                    help="Your Google Scholar profile URL"
+                )
+
+                st.warning("⚠️ Auto-fetch may be blocked by Google. Use the manual paste method below.")
+
+                with st.expander("📋 How to copy your Scholar HTML (recommended)", expanded=True):
+                    st.markdown(f"""
+                    1. Open your [Google Scholar profile]({scholar_url}) in a browser
+                    2. Scroll down to load all papers you want
+                    3. Right-click → **View Page Source** (or Ctrl+U / Cmd+Option+U)
+                    4. Select all (Ctrl+A / Cmd+A) and copy
+                    5. Paste below
+                    """)
+
+                html_input = st.text_area(
+                    "Paste Google Scholar HTML here",
+                    height=200,
+                    placeholder="<!DOCTYPE html>...",
+                    help="Paste the full page source HTML"
+                )
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Extract from Pasted HTML", type="primary", disabled=not (html_input and bib_url)):
+                        with st.spinner("AI is extracting publications (this may take a minute)..."):
+                            st.session_state.scholar_pubs = extract_with_llm(html_input, lm_studio_url)
+
+                        with st.spinner("Fetching existing BibTeX entries..."):
+                            st.session_state.existing_entries = fetch_existing_bib(bib_url)
+
+                        if st.session_state.scholar_pubs:
+                            st.success(f"Extracted {len(st.session_state.scholar_pubs)} publications")
+                            if st.session_state.existing_entries:
+                                with st.spinner("Finding missing papers..."):
+                                    st.session_state.missing_papers = find_missing_papers(
+                                        st.session_state.scholar_pubs,
+                                        st.session_state.existing_entries,
+                                        lm_studio_url,
+                                        st.session_state.get("use_ai_disambiguation", True),
+                                        st.session_state.get("match_threshold", 85),
+                                        st.session_state.get("uncertain_threshold", 60)
+                                    )
+                                st.session_state.step = 2
+                                st.rerun()
+
+                with col2:
+                    # Extract user ID for auto-fetch attempt
+                    user_id = ""
+                    if scholar_url and "user=" in scholar_url:
+                        match = re.search(r'user=([^&]+)', scholar_url)
+                        if match:
+                            user_id = match.group(1)
+
+                    num_papers = st.number_input("Papers to fetch", 10, 100, 50, 10)
+
+                    if st.button("Try Auto-Fetch", disabled=not (user_id and bib_url), help="May be blocked by Google"):
+                        with st.spinner("Fetching Google Scholar profile..."):
+                            try:
+                                html_content = fetch_scholar_html(user_id, num_papers)
+                                st.success("Fetched Scholar page successfully!")
+                            except Exception as e:
+                                st.error(f"Blocked or failed: {e}")
+                                html_content = None
+
+                        if html_content:
+                            with st.spinner("AI is extracting publications..."):
+                                st.session_state.scholar_pubs = extract_with_llm(html_content, lm_studio_url)
+
+                            with st.spinner("Fetching existing BibTeX entries..."):
+                                st.session_state.existing_entries = fetch_existing_bib(bib_url)
+
+                            if st.session_state.scholar_pubs:
+                                st.success(f"Extracted {len(st.session_state.scholar_pubs)} publications")
+                                if st.session_state.existing_entries:
+                                    with st.spinner("Finding missing papers..."):
+                                        st.session_state.missing_papers = find_missing_papers(
+                                            st.session_state.scholar_pubs,
+                                            st.session_state.existing_entries,
+                                            lm_studio_url,
+                                            st.session_state.get("use_ai_disambiguation", True),
+                                            st.session_state.get("match_threshold", 85),
+                                            st.session_state.get("uncertain_threshold", 60)
+                                        )
+                                    st.session_state.step = 2
+                                    st.rerun()
+
+            elif input_method == "LM Studio (AI extraction)":
+                st.info("Paste your Google Scholar profile HTML and let AI extract publications")
+
+                with st.expander("How to get your Scholar HTML"):
+                    st.markdown("""
+                    1. Go to your Google Scholar profile
+                    2. Right-click → "View Page Source" (or Ctrl+U / Cmd+Option+U)
+                    3. Select all (Ctrl+A / Cmd+A) and copy
+                    4. Paste below
+                    """)
+
+                html_input = st.text_area(
+                    "Paste Google Scholar HTML here",
+                    height=300,
+                    placeholder="<!DOCTYPE html>..."
+                )
+
+                if st.button("Extract with AI", type="primary", disabled=not (html_input and bib_url)):
                     with st.spinner("AI is extracting publications (this may take a minute)..."):
                         st.session_state.scholar_pubs = extract_with_llm(html_input, lm_studio_url)
 
@@ -882,74 +1100,23 @@ def main():
                             st.session_state.step = 2
                             st.rerun()
 
-            with col2:
-                # Extract user ID for auto-fetch attempt
-                user_id = ""
-                if scholar_url and "user=" in scholar_url:
-                    match = re.search(r'user=([^&]+)', scholar_url)
-                    if match:
-                        user_id = match.group(1)
+            elif input_method == "Paste HTML + AI":
+                st.info("Same as above - paste HTML for AI extraction")
 
-                num_papers = st.number_input("Papers to fetch", 10, 100, 50, 10)
+                html_input = st.text_area(
+                    "Paste any HTML containing publications",
+                    height=300,
+                    placeholder="<html>..."
+                )
 
-                if st.button("Try Auto-Fetch", disabled=not (user_id and bib_url), help="May be blocked by Google"):
-                    with st.spinner("Fetching Google Scholar profile..."):
-                        try:
-                            html_content = fetch_scholar_html(user_id, num_papers)
-                            st.success("Fetched Scholar page successfully!")
-                        except Exception as e:
-                            st.error(f"Blocked or failed: {e}")
-                            html_content = None
+                if st.button("Extract with AI", type="primary", disabled=not (html_input and bib_url)):
+                    with st.spinner("AI is extracting publications..."):
+                        st.session_state.scholar_pubs = extract_with_llm(html_input, lm_studio_url)
 
-                    if html_content:
-                        with st.spinner("AI is extracting publications..."):
-                            st.session_state.scholar_pubs = extract_with_llm(html_content, lm_studio_url)
+                    with st.spinner("Fetching existing BibTeX entries..."):
+                        st.session_state.existing_entries = fetch_existing_bib(bib_url)
 
-                        with st.spinner("Fetching existing BibTeX entries..."):
-                            st.session_state.existing_entries = fetch_existing_bib(bib_url)
-
-                        if st.session_state.scholar_pubs:
-                            st.success(f"Extracted {len(st.session_state.scholar_pubs)} publications")
-                            if st.session_state.existing_entries:
-                                with st.spinner("Finding missing papers..."):
-                                    st.session_state.missing_papers = find_missing_papers(
-                                        st.session_state.scholar_pubs,
-                                        st.session_state.existing_entries,
-                                        lm_studio_url,
-                                        st.session_state.get("use_ai_disambiguation", True),
-                                        st.session_state.get("match_threshold", 85),
-                                        st.session_state.get("uncertain_threshold", 60)
-                                    )
-                                st.session_state.step = 2
-                                st.rerun()
-
-        elif input_method == "LM Studio (AI extraction)":
-            st.info("Paste your Google Scholar profile HTML and let AI extract publications")
-
-            with st.expander("How to get your Scholar HTML"):
-                st.markdown("""
-                1. Go to your Google Scholar profile
-                2. Right-click → "View Page Source" (or Ctrl+U / Cmd+Option+U)
-                3. Select all (Ctrl+A / Cmd+A) and copy
-                4. Paste below
-                """)
-
-            html_input = st.text_area(
-                "Paste Google Scholar HTML here",
-                height=300,
-                placeholder="<!DOCTYPE html>..."
-            )
-
-            if st.button("Extract with AI", type="primary", disabled=not (html_input and bib_url)):
-                with st.spinner("AI is extracting publications (this may take a minute)..."):
-                    st.session_state.scholar_pubs = extract_with_llm(html_input, lm_studio_url)
-
-                with st.spinner("Fetching existing BibTeX entries..."):
-                    st.session_state.existing_entries = fetch_existing_bib(bib_url)
-
-                if st.session_state.scholar_pubs:
-                    st.success(f"Extracted {len(st.session_state.scholar_pubs)} publications")
-                    if st.session_state.existing_entries:
+                    if st.session_state.scholar_pubs and st.session_state.existing_entries:
                         with st.spinner("Finding missing papers..."):
                             st.session_state.missing_papers = find_missing_papers(
                                 st.session_state.scholar_pubs,
@@ -962,299 +1129,306 @@ def main():
                         st.session_state.step = 2
                         st.rerun()
 
-        elif input_method == "Paste HTML + AI":
-            st.info("Same as above - paste HTML for AI extraction")
+            elif input_method == "Paste BibTeX":
+                st.info("Export BibTeX from Google Scholar and paste below")
+                st.markdown("**How to export:** Go to Scholar profile → Select articles → Export → BibTeX")
 
-            html_input = st.text_area(
-                "Paste any HTML containing publications",
-                height=300,
-                placeholder="<html>..."
-            )
+                bibtex_input = st.text_area(
+                    "Paste BibTeX entries here",
+                    height=300,
+                    placeholder="@article{...\n}\n@inproceedings{...\n}"
+                )
 
-            if st.button("Extract with AI", type="primary", disabled=not (html_input and bib_url)):
-                with st.spinner("AI is extracting publications..."):
-                    st.session_state.scholar_pubs = extract_with_llm(html_input, lm_studio_url)
+                if st.button("Process BibTeX", type="primary", disabled=not (bibtex_input and bib_url)):
+                    with st.spinner("Parsing BibTeX..."):
+                        st.session_state.scholar_pubs = parse_bibtex_input(bibtex_input)
 
-                with st.spinner("Fetching existing BibTeX entries..."):
-                    st.session_state.existing_entries = fetch_existing_bib(bib_url)
+                    with st.spinner("Fetching existing BibTeX entries..."):
+                        st.session_state.existing_entries = fetch_existing_bib(bib_url)
 
-                if st.session_state.scholar_pubs and st.session_state.existing_entries:
-                    with st.spinner("Finding missing papers..."):
-                        st.session_state.missing_papers = find_missing_papers(
-                            st.session_state.scholar_pubs,
-                            st.session_state.existing_entries,
-                            lm_studio_url,
-                            st.session_state.get("use_ai_disambiguation", True),
-                            st.session_state.get("match_threshold", 85),
-                            st.session_state.get("uncertain_threshold", 60)
-                        )
-                    st.session_state.step = 2
-                    st.rerun()
-
-        elif input_method == "Paste BibTeX":
-            st.info("Export BibTeX from Google Scholar and paste below")
-            st.markdown("**How to export:** Go to Scholar profile → Select articles → Export → BibTeX")
-
-            bibtex_input = st.text_area(
-                "Paste BibTeX entries here",
-                height=300,
-                placeholder="@article{...\n}\n@inproceedings{...\n}"
-            )
-
-            if st.button("Process BibTeX", type="primary", disabled=not (bibtex_input and bib_url)):
-                with st.spinner("Parsing BibTeX..."):
-                    st.session_state.scholar_pubs = parse_bibtex_input(bibtex_input)
-
-                with st.spinner("Fetching existing BibTeX entries..."):
-                    st.session_state.existing_entries = fetch_existing_bib(bib_url)
-
-                if st.session_state.scholar_pubs and st.session_state.existing_entries:
-                    with st.spinner("Finding missing papers..."):
-                        st.session_state.missing_papers = find_missing_papers(
-                            st.session_state.scholar_pubs,
-                            st.session_state.existing_entries,
-                            lm_studio_url,
-                            st.session_state.get("use_ai_disambiguation", True),
-                            st.session_state.get("match_threshold", 85),
-                            st.session_state.get("uncertain_threshold", 60)
-                        )
-                    st.session_state.step = 2
-                    st.rerun()
-
-        elif input_method == "Paste text list":
-            st.info("Paste publications as text (one per line)")
-            st.markdown("**Format:** `Title | Authors | Year | Venue`")
-
-            text_input = st.text_area(
-                "Paste publications here",
-                height=300,
-                placeholder="My Paper Title | Smith J, Doe A | 2024 | Nature\nAnother Paper | Jones B | 2023 | Science"
-            )
-
-            if st.button("Process List", type="primary", disabled=not (text_input and bib_url)):
-                with st.spinner("Parsing publications..."):
-                    st.session_state.scholar_pubs = parse_manual_publications(text_input)
-
-                with st.spinner("Fetching existing BibTeX entries..."):
-                    st.session_state.existing_entries = fetch_existing_bib(bib_url)
-
-                if st.session_state.scholar_pubs and st.session_state.existing_entries:
-                    with st.spinner("Finding missing papers..."):
-                        st.session_state.missing_papers = find_missing_papers(
-                            st.session_state.scholar_pubs,
-                            st.session_state.existing_entries,
-                            lm_studio_url,
-                            st.session_state.get("use_ai_disambiguation", True),
-                            st.session_state.get("match_threshold", 85),
-                            st.session_state.get("uncertain_threshold", 60)
-                        )
-                    st.session_state.step = 2
-                    st.rerun()
-
-    elif st.session_state.step >= 2:
-        # Display statistics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Scholar Publications", len(st.session_state.scholar_pubs))
-        with col2:
-            st.metric("Existing in BibTeX", len(st.session_state.existing_entries))
-        with col3:
-            st.metric("Missing Papers", len(st.session_state.missing_papers))
-
-        st.divider()
-
-        if not st.session_state.missing_papers:
-            st.success("All your Google Scholar papers are already in papers.bib!")
-        else:
-            st.subheader("Review Missing Papers")
-
-            # DOI Batch Lookup Section
-            if st.session_state.doi_lookup_enabled:
-                doi_col1, doi_col2 = st.columns([3, 1])
-                with doi_col1:
-                    found_count = sum(1 for d in st.session_state.dois.values()
-                                     if d.get("status") == "found")
-                    total_papers = len(st.session_state.missing_papers)
-                    st.caption(f"DOIs found: {found_count}/{total_papers}")
-
-                with doi_col2:
-                    if st.button("Lookup All DOIs", type="secondary"):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-
-                        def update_progress(current, total, title):
-                            progress_bar.progress(current / total)
-                            status_text.text(f"Looking up: {title}...")
-
-                        mailto = st.session_state.get("crossref_email", "user@example.com")
-                        results = lookup_dois_batch(
-                            st.session_state.missing_papers,
-                            mailto,
-                            update_progress
-                        )
-                        st.session_state.dois = results
-
-                        # Update selections with found DOIs
-                        for i, doi_info in results.items():
-                            paper_id = f"paper_{i}"
-                            if paper_id in st.session_state.selections:
-                                if doi_info.get("doi"):
-                                    st.session_state.selections[paper_id]["doi"] = doi_info["doi"]
-
-                        progress_bar.empty()
-                        status_text.empty()
-                        found = sum(1 for d in results.values() if d.get("status") == "found")
-                        st.success(f"Found {found} DOIs out of {len(results)} papers")
+                    if st.session_state.scholar_pubs and st.session_state.existing_entries:
+                        with st.spinner("Finding missing papers..."):
+                            st.session_state.missing_papers = find_missing_papers(
+                                st.session_state.scholar_pubs,
+                                st.session_state.existing_entries,
+                                lm_studio_url,
+                                st.session_state.get("use_ai_disambiguation", True),
+                                st.session_state.get("match_threshold", 85),
+                                st.session_state.get("uncertain_threshold", 60)
+                            )
+                        st.session_state.step = 2
                         st.rerun()
 
-            # Store selections in session state
-            if "selections" not in st.session_state:
-                st.session_state.selections = {}
+            elif input_method == "Paste text list":
+                st.info("Paste publications as text (one per line)")
+                st.markdown("**Format:** `Title | Authors | Year | Venue`")
 
-            # Initialize all selections first
-            for i, paper in enumerate(st.session_state.missing_papers):
-                paper_id = f"paper_{i}"
-                if paper_id not in st.session_state.selections:
-                    default_key = generate_citation_key(paper["authors"], paper["year"])
-                    default_abbr = "Article"
-                    venue = paper["venue"].lower() if paper["venue"] else ""
-                    if "conference" in venue or "proceedings" in venue:
-                        default_abbr = "Conf"
-                    elif "journal" in venue:
-                        default_abbr = "Journal"
+                text_input = st.text_area(
+                    "Paste publications here",
+                    height=300,
+                    placeholder="My Paper Title | Smith J, Doe A | 2024 | Nature\nAnother Paper | Jones B | 2023 | Science"
+                )
 
-                    # Get DOI if already looked up
-                    doi_info = st.session_state.dois.get(i, {})
-                    default_doi = doi_info.get("doi", "")
+                if st.button("Process List", type="primary", disabled=not (text_input and bib_url)):
+                    with st.spinner("Parsing publications..."):
+                        st.session_state.scholar_pubs = parse_manual_publications(text_input)
 
-                    st.session_state.selections[paper_id] = {
-                        "include": True,
-                        "citation_key": default_key,
-                        "abbr": default_abbr,
-                        "doi": default_doi,
-                    }
+                    with st.spinner("Fetching existing BibTeX entries..."):
+                        st.session_state.existing_entries = fetch_existing_bib(bib_url)
 
-            # Render papers
-            for i, paper in enumerate(st.session_state.missing_papers):
-                paper_id = f"paper_{i}"
-
-                # Add DOI status indicator to expander title
-                doi_info = st.session_state.dois.get(i, {})
-                doi_status_icon = ""
-                if doi_info.get("verified"):
-                    doi_status_icon = " [DOI]"
-                elif doi_info.get("status") == "found":
-                    doi_status_icon = " [DOI?]"
-
-                with st.expander(
-                    f"{'✅' if st.session_state.selections[paper_id]['include'] else '⬜'} **{paper['title'][:70]}{'...' if len(paper['title']) > 70 else ''}** ({paper['year']}){doi_status_icon}",
-                    expanded=False
-                ):
-                    render_paper_card(paper, i, st.session_state.selections, st.session_state.dois)
-
-                    # Editable BibTeX
-                    if st.session_state.selections[paper_id]["include"]:
-                        st.markdown("##### Generated BibTeX")
-                        paper_doi = st.session_state.selections[paper_id].get("doi", "")
-                        default_bibtex = format_bibtex_entry(
-                            paper,
-                            st.session_state.selections[paper_id]["citation_key"],
-                            st.session_state.selections[paper_id]["abbr"],
-                            paper_doi
-                        )
-
-                        # Store edited bibtex in session state
-                        if f"bibtex_{paper_id}" not in st.session_state:
-                            st.session_state[f"bibtex_{paper_id}"] = default_bibtex
-
-                        col_edit, col_copy = st.columns([5, 1])
-                        with col_edit:
-                            edited_bibtex = st.text_area(
-                                "Edit BibTeX",
-                                value=st.session_state[f"bibtex_{paper_id}"],
-                                height=200,
-                                key=f"edit_bibtex_{paper_id}",
-                                label_visibility="collapsed"
+                    if st.session_state.scholar_pubs and st.session_state.existing_entries:
+                        with st.spinner("Finding missing papers..."):
+                            st.session_state.missing_papers = find_missing_papers(
+                                st.session_state.scholar_pubs,
+                                st.session_state.existing_entries,
+                                lm_studio_url,
+                                st.session_state.get("use_ai_disambiguation", True),
+                                st.session_state.get("match_threshold", 85),
+                                st.session_state.get("uncertain_threshold", 60)
                             )
-                            st.session_state[f"bibtex_{paper_id}"] = edited_bibtex
+                        st.session_state.step = 2
+                        st.rerun()
 
-                        with col_copy:
-                            # Copy button using JS
-                            st.markdown(f"""
-                            <button onclick="navigator.clipboard.writeText(document.getElementById('bibtex_content_{i}').value); this.innerHTML='✓ Copied!';"
-                                    style="background:#667eea; color:white; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; margin-top:5px;">
-                                📋 Copy
-                            </button>
-                            <textarea id="bibtex_content_{i}" style="display:none;">{edited_bibtex}</textarea>
-                            """, unsafe_allow_html=True)
-
-                        # Reset to default button
-                        if st.button("↻ Reset to default", key=f"reset_{paper_id}"):
-                            st.session_state[f"bibtex_{paper_id}"] = default_bibtex
-                            st.rerun()
+        elif st.session_state.step >= 2:
+            # Display statistics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Scholar Publications", len(st.session_state.scholar_pubs))
+            with col2:
+                st.metric("Existing in BibTeX", len(st.session_state.existing_entries))
+            with col3:
+                st.metric("Missing Papers", len(st.session_state.missing_papers))
 
             st.divider()
 
-            # Generate output
-            col1, col2 = st.columns(2)
+            if not st.session_state.missing_papers:
+                st.success("All your Google Scholar papers are already in papers.bib!")
+            else:
+                st.subheader("Review Missing Papers")
 
-            with col1:
-                selected_count = sum(
-                    1 for s in st.session_state.selections.values() if s["include"]
-                )
-                st.info(f"Selected {selected_count} papers for export")
+                # DOI Batch Lookup Section
+                if st.session_state.doi_lookup_enabled:
+                    doi_col1, doi_col2 = st.columns([3, 1])
+                    with doi_col1:
+                        found_count = sum(1 for d in st.session_state.dois.values()
+                                         if d.get("status") == "found")
+                        total_papers = len(st.session_state.missing_papers)
+                        st.caption(f"DOIs found: {found_count}/{total_papers}")
 
-            with col2:
-                if st.button("Generate BibTeX File", type="primary", disabled=selected_count == 0):
-                    # Build output using edited bibtex
-                    output_entries = []
-                    for i, paper in enumerate(st.session_state.missing_papers):
-                        paper_id = f"paper_{i}"
-                        if st.session_state.selections[paper_id]["include"]:
-                            # Use edited version if available
-                            paper_doi = st.session_state.selections[paper_id].get("doi", "")
-                            bibtex = st.session_state.get(
-                                f"bibtex_{paper_id}",
-                                format_bibtex_entry(
-                                    paper,
-                                    st.session_state.selections[paper_id]["citation_key"],
-                                    st.session_state.selections[paper_id]["abbr"],
-                                    paper_doi
-                                )
+                    with doi_col2:
+                        if st.button("Lookup All DOIs", type="secondary"):
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+
+                            def update_progress(current, total, title):
+                                progress_bar.progress(current / total)
+                                status_text.text(f"Looking up: {title}...")
+
+                            mailto = st.session_state.get("crossref_email", "user@example.com")
+                            results = lookup_dois_batch(
+                                st.session_state.missing_papers,
+                                mailto,
+                                update_progress
                             )
-                            output_entries.append(bibtex)
+                            st.session_state.dois = results
 
-                    output_content = "\n\n".join(output_entries)
+                            # Update selections with found DOIs
+                            for i, doi_info in results.items():
+                                paper_id = f"paper_{i}"
+                                if paper_id in st.session_state.selections:
+                                    if doi_info.get("doi"):
+                                        st.session_state.selections[paper_id]["doi"] = doi_info["doi"]
 
-                    # Save to file
-                    date_str = datetime.now().strftime("%Y-%m-%d")
-                    output_file = OUTPUT_DIR / f"new_papers_{date_str}.bib"
-                    output_file.write_text(output_content)
+                            progress_bar.empty()
+                            status_text.empty()
+                            found = sum(1 for d in results.values() if d.get("status") == "found")
+                            st.success(f"Found {found} DOIs out of {len(results)} papers")
+                            st.rerun()
 
-                    st.session_state.output_content = output_content
-                    st.session_state.output_file = str(output_file)
-                    st.session_state.step = 3
+                # Store selections in session state
+                if "selections" not in st.session_state:
+                    st.session_state.selections = {}
+
+                # Initialize all selections first
+                for i, paper in enumerate(st.session_state.missing_papers):
+                    paper_id = f"paper_{i}"
+                    if paper_id not in st.session_state.selections:
+                        default_key = generate_citation_key(paper["authors"], paper["year"])
+                        default_abbr = "Article"
+                        venue = paper["venue"].lower() if paper["venue"] else ""
+                        if "conference" in venue or "proceedings" in venue:
+                            default_abbr = "Conf"
+                        elif "journal" in venue:
+                            default_abbr = "Journal"
+
+                        # Get DOI if already looked up
+                        doi_info = st.session_state.dois.get(i, {})
+                        default_doi = doi_info.get("doi", "")
+
+                        st.session_state.selections[paper_id] = {
+                            "include": True,
+                            "citation_key": default_key,
+                            "abbr": default_abbr,
+                            "doi": default_doi,
+                        }
+
+                # Render papers
+                for i, paper in enumerate(st.session_state.missing_papers):
+                    paper_id = f"paper_{i}"
+
+                    # Add DOI status indicator to expander title
+                    doi_info = st.session_state.dois.get(i, {})
+                    doi_status_icon = ""
+                    if doi_info.get("verified"):
+                        doi_status_icon = " [DOI]"
+                    elif doi_info.get("status") == "found":
+                        doi_status_icon = " [DOI?]"
+
+                    with st.expander(
+                        f"{'✅' if st.session_state.selections[paper_id]['include'] else '⬜'} **{paper['title'][:70]}{'...' if len(paper['title']) > 70 else ''}** ({paper['year']}){doi_status_icon}",
+                        expanded=False
+                    ):
+                        render_paper_card(paper, i, st.session_state.selections, st.session_state.dois)
+
+                        # Editable BibTeX
+                        if st.session_state.selections[paper_id]["include"]:
+                            st.markdown("##### Generated BibTeX")
+                            paper_doi = st.session_state.selections[paper_id].get("doi", "")
+                            default_bibtex = format_bibtex_entry(
+                                paper,
+                                st.session_state.selections[paper_id]["citation_key"],
+                                st.session_state.selections[paper_id]["abbr"],
+                                paper_doi
+                            )
+
+                            # Store edited bibtex in session state
+                            if f"bibtex_{paper_id}" not in st.session_state:
+                                st.session_state[f"bibtex_{paper_id}"] = default_bibtex
+
+                            col_edit, col_copy = st.columns([5, 1])
+                            with col_edit:
+                                edited_bibtex = st.text_area(
+                                    "Edit BibTeX",
+                                    value=st.session_state[f"bibtex_{paper_id}"],
+                                    height=200,
+                                    key=f"edit_bibtex_{paper_id}",
+                                    label_visibility="collapsed"
+                                )
+                                st.session_state[f"bibtex_{paper_id}"] = edited_bibtex
+
+                            with col_copy:
+                                # Copy button using JS
+                                st.markdown(f"""
+                                <button onclick="navigator.clipboard.writeText(document.getElementById('bibtex_content_{i}').value); this.innerHTML='✓ Copied!';"
+                                        style="background:#667eea; color:white; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; margin-top:5px;">
+                                    📋 Copy
+                                </button>
+                                <textarea id="bibtex_content_{i}" style="display:none;">{edited_bibtex}</textarea>
+                                """, unsafe_allow_html=True)
+
+                            # Reset to default button
+                            if st.button("↻ Reset to default", key=f"reset_{paper_id}"):
+                                st.session_state[f"bibtex_{paper_id}"] = default_bibtex
+                                st.rerun()
+
+                st.divider()
+
+                # Re-run disambiguation button
+                if st.button("🤖 Re-run AI Disambiguation"):
+                    with st.spinner("Re-checking with AI..."):
+                        lm_url = st.session_state.get("lm_studio_url", "http://localhost:1234/v1")
+                        st.session_state.missing_papers = find_missing_papers(
+                            st.session_state.scholar_pubs, st.session_state.existing_entries, lm_url,
+                            st.session_state.get("use_ai_disambiguation", True),
+                            st.session_state.get("match_threshold", 85),
+                            st.session_state.get("uncertain_threshold", 60))
+                        st.session_state.selections = {}
+                        st.session_state.dois = {}
+                    st.success(f"Found {len(st.session_state.missing_papers)} missing papers")
                     st.rerun()
 
-    if st.session_state.step == 3:
-        st.success(f"Saved to: {st.session_state.output_file}")
+                st.divider()
 
-        st.download_button(
-            label="Download BibTeX File",
-            data=st.session_state.output_content,
-            file_name=Path(st.session_state.output_file).name,
-            mime="text/plain"
-        )
+                # Generate output
+                selected_count = sum(1 for s in st.session_state.selections.values() if s["include"])
+                st.info(f"Selected {selected_count} papers")
 
-        with st.expander("Preview Generated BibTeX", expanded=True):
-            st.code(st.session_state.output_content, language="bibtex")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if st.button("📥 Generate BibTeX", type="primary", disabled=selected_count == 0):
+                        # Build output using edited bibtex
+                        output_entries = []
+                        for i, paper in enumerate(st.session_state.missing_papers):
+                            paper_id = f"paper_{i}"
+                            if st.session_state.selections[paper_id]["include"]:
+                                # Use edited version if available
+                                paper_doi = st.session_state.selections[paper_id].get("doi", "")
+                                bibtex = st.session_state.get(
+                                    f"bibtex_{paper_id}",
+                                    format_bibtex_entry(
+                                        paper,
+                                        st.session_state.selections[paper_id]["citation_key"],
+                                        st.session_state.selections[paper_id]["abbr"],
+                                        paper_doi
+                                    )
+                                )
+                                output_entries.append(bibtex)
 
-        if st.button("Start Over"):
-            for key in ["scholar_pubs", "existing_entries", "missing_papers",
-                       "selections", "output_content", "output_file", "step", "dois"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
+                        output_content = "\n\n".join(output_entries)
+
+                        # Save to file
+                        date_str = datetime.now().strftime("%Y-%m-%d")
+                        output_file = OUTPUT_DIR / f"new_papers_{date_str}.bib"
+                        output_file.write_text(output_content)
+
+                        st.session_state.output_content = output_content
+                        st.session_state.output_file = str(output_file)
+                        st.session_state.step = 3
+                        st.rerun()
+
+                with col2:
+                    if st.button("💾 Save to Database", disabled=selected_count == 0):
+                        saved = 0
+                        for i, paper in enumerate(st.session_state.missing_papers):
+                            paper_id = f"paper_{i}"
+                            if st.session_state.selections[paper_id]["include"]:
+                                paper_doi = st.session_state.selections[paper_id].get("doi", "")
+                                paper_data = {**paper, "doi": paper_doi,
+                                    "citation_key": st.session_state.selections[paper_id]["citation_key"],
+                                    "abbr": st.session_state.selections[paper_id]["abbr"],
+                                    "bibtex": st.session_state.get(f"bibtex_{paper_id}",
+                                        format_bibtex_entry(paper, st.session_state.selections[paper_id]["citation_key"],
+                                            st.session_state.selections[paper_id]["abbr"], paper_doi))}
+                                if save_to_db(paper_data, "sync"): saved += 1
+                        st.success(f"Saved {saved} papers to database!")
+
+                with col3:
+                    if st.button("🔄 Start Over"):
+                        for key in ["scholar_pubs", "existing_entries", "missing_papers",
+                                   "selections", "output_content", "output_file", "dois"]:
+                            if key in st.session_state: del st.session_state[key]
+                        st.session_state.step = 1
+                        st.rerun()
+
+        if st.session_state.step == 3:
+            st.success(f"Saved to: {st.session_state.output_file}")
+
+            st.download_button(
+                label="Download BibTeX File",
+                data=st.session_state.output_content,
+                file_name=Path(st.session_state.output_file).name,
+                mime="text/plain"
+            )
+
+            with st.expander("Preview Generated BibTeX", expanded=True):
+                st.code(st.session_state.output_content, language="bibtex")
+
+            if st.button("Start Over"):
+                for key in ["scholar_pubs", "existing_entries", "missing_papers",
+                           "selections", "output_content", "output_file", "step", "dois"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
 
 
 if __name__ == "__main__":
