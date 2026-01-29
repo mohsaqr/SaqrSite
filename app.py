@@ -318,31 +318,169 @@ def normalize_title(title: str) -> str:
     return title
 
 
-def find_missing_papers(scholar_pubs: list[dict], existing_entries: list[dict]) -> list[dict]:
-    """Find papers in Scholar that are not in existing BibTeX using fuzzy matching."""
+def normalize_title_advanced(title: str) -> str:
+    """Advanced title normalization for better matching."""
+    title = title.lower()
+    # Remove common variations
+    title = re.sub(r"[^\w\s]", " ", title)  # Replace punctuation with space
+    title = re.sub(r"\b(a|an|the|of|in|on|at|to|for|and|or|with)\b", "", title)  # Remove stop words
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def get_title_tokens(title: str) -> set:
+    """Get significant tokens from title for set-based comparison."""
+    normalized = normalize_title_advanced(title)
+    # Filter out very short words
+    return set(word for word in normalized.split() if len(word) > 2)
+
+
+def normalize_author_name(name: str) -> str:
+    """Normalize author name for comparison."""
+    name = name.lower()
+    name = re.sub(r"[^\w\s]", "", name)
+    # Extract last name (handle both "Last, First" and "First Last")
+    parts = name.replace(",", " ").split()
+    if parts:
+        # Return longest part (likely the last name)
+        return max(parts, key=len)
+    return name
+
+
+def ai_disambiguate(pub1: dict, pub2: dict, lm_studio_url: str) -> bool:
+    """Use AI to determine if two papers are the same."""
+    import json
+
+    prompt = f"""Are these two academic paper entries referring to the SAME paper? Consider:
+- Minor title variations (punctuation, word order, abbreviations)
+- Author name formats may differ
+- Same year is a strong signal
+
+Paper 1:
+Title: {pub1.get('title', '')}
+Authors: {pub1.get('authors', '')}
+Year: {pub1.get('year', '')}
+
+Paper 2:
+Title: {pub2.get('title', '')}
+Authors: {pub2.get('authors', '')}
+Year: {pub2.get('year', '')}
+
+Answer with ONLY "SAME" or "DIFFERENT" (one word, no explanation):"""
+
+    try:
+        response = requests.post(
+            f"{lm_studio_url}/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 10
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+        result = response.json()
+        answer = result["choices"][0]["message"]["content"].strip().upper()
+        return "SAME" in answer
+    except Exception:
+        # If AI fails, fall back to conservative (not same)
+        return False
+
+
+def compute_similarity_score(pub: dict, existing: dict) -> tuple[float, str]:
+    """
+    Compute comprehensive similarity score between two papers.
+    Returns (score, reason) where score is 0-100.
+    """
+    scores = []
+    reasons = []
+
+    pub_title = pub.get("title", "")
+    existing_title = existing.get("title", "")
+
+    # 1. Exact normalized match
+    if normalize_title(pub_title) == normalize_title(existing_title):
+        return 100, "exact_match"
+
+    # 2. Fuzzy ratio
+    ratio = fuzz.ratio(normalize_title(pub_title), normalize_title(existing_title))
+    scores.append(ratio)
+
+    # 3. Token overlap (handles word reordering)
+    pub_tokens = get_title_tokens(pub_title)
+    existing_tokens = get_title_tokens(existing_title)
+    if pub_tokens and existing_tokens:
+        overlap = len(pub_tokens & existing_tokens)
+        union = len(pub_tokens | existing_tokens)
+        token_score = (overlap / union) * 100 if union > 0 else 0
+        scores.append(token_score)
+
+    # 4. Partial ratio (handles substrings)
+    partial = fuzz.partial_ratio(normalize_title(pub_title), normalize_title(existing_title))
+    scores.append(partial * 0.9)  # Slightly discount partial matches
+
+    # 5. Token sort ratio (handles reordering)
+    token_sort = fuzz.token_sort_ratio(normalize_title(pub_title), normalize_title(existing_title))
+    scores.append(token_sort)
+
+    base_score = max(scores)
+
+    # Boost score if year matches
+    if pub.get("year") and existing.get("year") and pub["year"] == existing["year"]:
+        base_score = min(100, base_score + 10)
+        reasons.append("year_match")
+
+    # Boost score if first author matches
+    pub_author = normalize_author_name(pub.get("authors", "").split(",")[0].split(" and ")[0])
+    existing_author = normalize_author_name(existing.get("authors", "").split(",")[0].split(" and ")[0])
+    if pub_author and existing_author and (pub_author in existing_author or existing_author in pub_author):
+        base_score = min(100, base_score + 10)
+        reasons.append("author_match")
+
+    reason = "+".join(reasons) if reasons else "title_similarity"
+    return base_score, reason
+
+
+def find_missing_papers(scholar_pubs: list[dict], existing_entries: list[dict],
+                        lm_studio_url: str = "http://localhost:1234/v1",
+                        use_ai_disambiguation: bool = True) -> list[dict]:
+    """Find papers in Scholar that are not in existing BibTeX using advanced matching."""
     missing = []
-    existing_titles = [normalize_title(e["title"]) for e in existing_entries]
-    existing_years = [e["year"] for e in existing_entries]
+    uncertain = []  # Papers that need AI disambiguation
 
     for pub in scholar_pubs:
-        pub_title_norm = normalize_title(pub["title"])
-        is_match = False
+        best_score = 0
+        best_match = None
+        best_reason = ""
 
-        # Check fuzzy title match
-        for i, existing_title in enumerate(existing_titles):
-            ratio = fuzz.ratio(pub_title_norm, existing_title)
-            partial_ratio = fuzz.partial_ratio(pub_title_norm, existing_title)
+        for existing in existing_entries:
+            score, reason = compute_similarity_score(pub, existing)
+            if score > best_score:
+                best_score = score
+                best_match = existing
+                best_reason = reason
 
-            # Match if high similarity OR (year matches AND partial title match)
-            if ratio >= 85 or partial_ratio >= 90:
-                is_match = True
-                break
-            elif pub["year"] == existing_years[i] and partial_ratio >= 75:
-                is_match = True
-                break
-
-        if not is_match:
+        # Decision thresholds
+        if best_score >= 85:
+            # High confidence match - skip this paper
+            continue
+        elif best_score >= 60 and use_ai_disambiguation:
+            # Uncertain - queue for AI disambiguation
+            uncertain.append((pub, best_match, best_score, best_reason))
+        else:
+            # Low similarity - definitely missing
             missing.append(pub)
+
+    # Process uncertain cases with AI
+    if uncertain and use_ai_disambiguation:
+        for pub, best_match, score, reason in uncertain:
+            try:
+                is_same = ai_disambiguate(pub, best_match, lm_studio_url)
+                if not is_same:
+                    missing.append(pub)
+            except Exception:
+                # If AI fails, be conservative and include as missing
+                missing.append(pub)
 
     return missing
 
@@ -709,7 +847,8 @@ def main():
                             with st.spinner("Finding missing papers..."):
                                 st.session_state.missing_papers = find_missing_papers(
                                     st.session_state.scholar_pubs,
-                                    st.session_state.existing_entries
+                                    st.session_state.existing_entries,
+                                    lm_studio_url
                                 )
                             st.session_state.step = 2
                             st.rerun()
@@ -746,7 +885,8 @@ def main():
                                 with st.spinner("Finding missing papers..."):
                                     st.session_state.missing_papers = find_missing_papers(
                                         st.session_state.scholar_pubs,
-                                        st.session_state.existing_entries
+                                        st.session_state.existing_entries,
+                                        lm_studio_url
                                     )
                                 st.session_state.step = 2
                                 st.rerun()
@@ -781,7 +921,8 @@ def main():
                         with st.spinner("Finding missing papers..."):
                             st.session_state.missing_papers = find_missing_papers(
                                 st.session_state.scholar_pubs,
-                                st.session_state.existing_entries
+                                st.session_state.existing_entries,
+                                lm_studio_url
                             )
                         st.session_state.step = 2
                         st.rerun()
@@ -806,7 +947,8 @@ def main():
                     with st.spinner("Finding missing papers..."):
                         st.session_state.missing_papers = find_missing_papers(
                             st.session_state.scholar_pubs,
-                            st.session_state.existing_entries
+                            st.session_state.existing_entries,
+                            lm_studio_url
                         )
                     st.session_state.step = 2
                     st.rerun()
@@ -832,7 +974,8 @@ def main():
                     with st.spinner("Finding missing papers..."):
                         st.session_state.missing_papers = find_missing_papers(
                             st.session_state.scholar_pubs,
-                            st.session_state.existing_entries
+                            st.session_state.existing_entries,
+                            lm_studio_url
                         )
                     st.session_state.step = 2
                     st.rerun()
@@ -858,7 +1001,8 @@ def main():
                     with st.spinner("Finding missing papers..."):
                         st.session_state.missing_papers = find_missing_papers(
                             st.session_state.scholar_pubs,
-                            st.session_state.existing_entries
+                            st.session_state.existing_entries,
+                            lm_studio_url
                         )
                     st.session_state.step = 2
                     st.rerun()
