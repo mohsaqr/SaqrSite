@@ -47,7 +47,7 @@ def save_to_db(paper: dict, source: str = "sync") -> bool:
     except: return False
     finally: conn.close()
 
-def search_db(query="", author="", year="", limit=200):
+def search_db(query="", author="", year="", sort_by="year", sort_order="DESC", limit=200):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conds, params = [], []
@@ -55,7 +55,8 @@ def search_db(query="", author="", year="", limit=200):
     if author: conds.append("authors LIKE ?"); params.append(f"%{author}%")
     if year: conds.append("year=?"); params.append(year)
     where = " AND ".join(conds) if conds else "1=1"
-    rows = conn.execute(f"SELECT * FROM papers WHERE {where} ORDER BY year DESC LIMIT ?", params+[limit]).fetchall()
+    order = f"{sort_by} {sort_order}"
+    rows = conn.execute(f"SELECT * FROM papers WHERE {where} ORDER BY {order} LIMIT ?", params+[limit]).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -82,6 +83,39 @@ def get_db_count():
     cnt = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
     conn.close()
     return cnt
+
+
+def decode_latex(text: str) -> str:
+    """Decode LaTeX special characters for display."""
+    if not text:
+        return text
+    replacements = [
+        (r"{\"a}", "ä"), (r"{\"o}", "ö"), (r"{\"u}", "ü"),
+        (r"{\"A}", "Ä"), (r"{\"O}", "Ö"), (r"{\"U}", "Ü"),
+        (r"{\\'a}", "á"), (r"{\'a}", "á"), (r"\\'a", "á"),
+        (r"{\\'e}", "é"), (r"{\'e}", "é"), (r"\\'e", "é"),
+        (r"{\\'i}", "í"), (r"{\'i}", "í"), (r"\\'i", "í"),
+        (r"{\\'o}", "ó"), (r"{\'o}", "ó"), (r"\\'o", "ó"),
+        (r"{\\'u}", "ú"), (r"{\'u}", "ú"), (r"\\'u", "ú"),
+        (r"{\\`a}", "à"), (r"{`a}", "à"),
+        (r"{\\`e}", "è"), (r"{`e}", "è"),
+        (r"{\\~n}", "ñ"), (r"{~n}", "ñ"), (r"\\~n", "ñ"),
+        (r"{\\c{c}}", "ç"), (r"{\\c c}", "ç"),
+        (r"{\ss}", "ß"), (r"\\ss", "ß"),
+        (r"{\\aa}", "å"), (r"{\\AA}", "Å"),
+        (r"{\\o}", "ø"), (r"{\\O}", "Ø"),
+        (r"{\\ae}", "æ"), (r"{\\AE}", "Æ"),
+        (r"{\\'y}", "ý"), (r"{\'y}", "ý"),
+        (r"{\\\"u}", "ü"), (r"\\\"u", "ü"),
+        (r"{\\\"o}", "ö"), (r"\\\"o", "ö"),
+        (r"{\\\"a}", "ä"), (r"\\\"a", "ä"),
+        (r"{\\'", ""), (r"{\'", ""), (r"'}", ""),  # cleanup
+        (r"{", ""), (r"}", ""),  # remove remaining braces
+    ]
+    result = text
+    for latex, char in replacements:
+        result = result.replace(latex, char)
+    return result
 
 
 # DOI Lookup and Verification Functions
@@ -682,15 +716,19 @@ def render_paper_card(paper: dict, index: int, selections: dict, dois: dict) -> 
         )
         selections[paper_id]["include"] = include
 
-        # Paper card HTML
+        # Paper card HTML - decode LaTeX for display
+        display_title = decode_latex(paper['title'])
+        display_authors = decode_latex(paper['authors'])
+        display_venue = decode_latex(paper['venue'] or 'Venue not specified')
+
         citations_badge = f'<span class="paper-badge paper-badge-cite">{paper["citations"]} citations</span>' if paper["citations"] else ''
         year_badge = f'<span class="paper-badge">{paper["year"]}</span>' if paper["year"] else ''
 
         card_html = f"""
         <div class="paper-card">
-            <div class="paper-title">{paper['title']}</div>
-            <div class="paper-authors">{paper['authors']}</div>
-            <div class="paper-venue">{paper['venue'] or 'Venue not specified'}</div>
+            <div class="paper-title">{display_title}</div>
+            <div class="paper-authors">{display_authors}</div>
+            <div class="paper-venue">{display_venue}</div>
             <div class="paper-meta">
                 {year_badge}
                 {citations_badge}
@@ -898,29 +936,78 @@ def main():
     # ============ MY PAPERS PAGE ============
     if page == "📂 My Papers":
         st.header("📂 My Papers Database")
-        c1, c2 = st.columns([3,1])
-        with c1: st.metric("Papers in Database", get_db_count())
+
+        # Sub-tabs for My Papers
+        papers_tab, import_tab = st.tabs(["📋 Browse Papers", "📥 Import Papers"])
+
+        with import_tab:
+            st.subheader("Import Papers to Database")
+            import_method = st.radio("Import from", ["Paste BibTeX", "Paste Text List"], horizontal=True)
+
+            if import_method == "Paste BibTeX":
+                bibtex_import = st.text_area("Paste BibTeX entries", height=300,
+                    placeholder="@article{key,\n  author = {...},\n  title = {...},\n  ...\n}")
+                if st.button("📥 Import BibTeX to Database", disabled=not bibtex_import):
+                    with st.spinner("Importing..."):
+                        papers = parse_bibtex_input(bibtex_import)
+                        imported = 0
+                        for p in papers:
+                            key = generate_citation_key(p.get("authors",""), p.get("year",""))
+                            p["citation_key"] = key
+                            p["bibtex"] = format_bibtex_entry(p, key, "Article", p.get("doi",""))
+                            if save_to_db(p, "bibtex_import"): imported += 1
+                        st.success(f"Imported {imported} of {len(papers)} papers!")
+                        st.rerun()
+
+            else:  # Text list
+                st.markdown("**Format:** `Title | Authors | Year | Venue`")
+                text_import = st.text_area("Paste papers (one per line)", height=300,
+                    placeholder="Paper Title | Smith J, Doe A | 2024 | Nature")
+                if st.button("📥 Import List to Database", disabled=not text_import):
+                    with st.spinner("Importing..."):
+                        papers = parse_manual_publications(text_import)
+                        imported = 0
+                        for p in papers:
+                            key = generate_citation_key(p.get("authors",""), p.get("year",""))
+                            p["citation_key"] = key
+                            p["bibtex"] = format_bibtex_entry(p, key, "Article", "")
+                            if save_to_db(p, "text_import"): imported += 1
+                        st.success(f"Imported {imported} of {len(papers)} papers!")
+                        st.rerun()
+
+        with papers_tab:
+            # Stats and refresh
+            c1, c2, c3 = st.columns([2,2,1])
+        with c1: st.metric("Total Papers", get_db_count())
         with c2:
+            years = get_db_years()
+            if years: st.metric("Year Range", f"{years[-1]} - {years[0]}")
+        with c3:
             if st.button("🔄 Refresh"): st.rerun()
 
         st.divider()
-        st.subheader("🔍 Search")
-        sc1, sc2, sc3 = st.columns(3)
+
+        # Search and Sort
+        st.subheader("🔍 Search & Filter")
+        sc1, sc2, sc3, sc4, sc5 = st.columns([2,2,1,1,1])
         with sc1: sq = st.text_input("Title/Venue", placeholder="learning analytics...")
         with sc2: sa = st.text_input("Author", placeholder="Saqr...")
         with sc3: sy = st.selectbox("Year", ["All"] + get_db_years())
+        with sc4: sort_by = st.selectbox("Sort by", ["year", "title", "authors", "citations"])
+        with sc5: sort_order = st.selectbox("Order", ["DESC", "ASC"])
 
-        results = search_db(sq, sa, sy if sy != "All" else "")
+        results = search_db(sq, sa, sy if sy != "All" else "", sort_by, sort_order)
         st.caption(f"Found {len(results)} papers")
 
         if "db_sel" not in st.session_state: st.session_state.db_sel = set()
 
+        # Action buttons
         ac1, ac2, ac3, ac4 = st.columns(4)
         with ac1:
             if st.button("☑️ Select All"): st.session_state.db_sel = {r["id"] for r in results}; st.rerun()
         with ac2:
-            if st.button("⬜ Clear"): st.session_state.db_sel.clear(); st.rerun()
-        with ac3: st.caption(f"{len(st.session_state.db_sel)} selected")
+            if st.button("⬜ Clear Selection"): st.session_state.db_sel.clear(); st.rerun()
+        with ac3: st.info(f"{len(st.session_state.db_sel)} selected")
         with ac4:
             if st.session_state.db_sel:
                 sel_papers = [r for r in results if r["id"] in st.session_state.db_sel]
@@ -933,33 +1020,64 @@ def main():
                 st.download_button("📥 Export BibTeX", "\n\n".join(bib_out), f"papers_{datetime.now().strftime('%Y%m%d')}.bib")
 
         st.divider()
+
+        # Paper list with decoded display
         for paper in results:
             pid = paper["id"]
             sel = pid in st.session_state.db_sel
-            with st.expander(f"{'☑️' if sel else '⬜'} **{paper['title'][:60]}...** ({paper['year']})"):
-                if st.checkbox("Select", value=sel, key=f"s_{pid}"):
-                    st.session_state.db_sel.add(pid)
-                else:
-                    st.session_state.db_sel.discard(pid)
-                st.markdown(f"**Authors:** {paper['authors']}")
-                st.markdown(f"**Venue:** {paper['venue'] or 'N/A'}")
-                if paper.get("doi"): st.markdown(f"**DOI:** `{paper['doi']}`")
+            # Decode LaTeX for display
+            display_title = decode_latex(paper['title'])
+            display_authors = decode_latex(paper['authors'])
+            display_venue = decode_latex(paper['venue'] or '')
 
-                b1, b2, b3 = st.columns(3)
+            with st.expander(f"{'☑️' if sel else '⬜'} **{display_title[:65]}{'...' if len(display_title) > 65 else ''}** ({paper['year']})"):
+                col_sel, col_info = st.columns([1, 5])
+                with col_sel:
+                    if st.checkbox("Select", value=sel, key=f"s_{pid}"):
+                        st.session_state.db_sel.add(pid)
+                    else:
+                        st.session_state.db_sel.discard(pid)
+
+                with col_info:
+                    st.markdown(f"**Authors:** {display_authors}")
+                    st.markdown(f"**Venue:** {display_venue or 'N/A'}")
+                    if paper.get("doi"):
+                        st.markdown(f"**DOI:** [{paper['doi']}](https://doi.org/{paper['doi']})")
+                    if paper.get("citations"):
+                        st.markdown(f"**Citations:** {paper['citations']}")
+
+                # Actions
+                b1, b2, b3, b4 = st.columns(4)
                 with b1:
-                    if st.button("🔍 DOI", key=f"d_{pid}"):
-                        res = lookup_doi(paper["title"], paper["authors"], paper["year"])
-                        if res["status"]=="found" and res["doi"]:
-                            update_db_doi(pid, res["doi"]); st.success(res["doi"]); st.rerun()
-                        else: st.warning("Not found")
+                    if st.button("🔍 Lookup DOI", key=f"d_{pid}"):
+                        with st.spinner("Looking up..."):
+                            res = lookup_doi(paper["title"], paper["authors"], paper["year"])
+                            if res["status"]=="found" and res["doi"]:
+                                update_db_doi(pid, res["doi"]); st.success(f"Found: {res['doi']}"); st.rerun()
+                            else: st.warning("DOI not found")
                 with b2:
-                    if st.button("🤖 Dups", key=f"c_{pid}"):
-                        dups = [(p["title"][:40], compute_similarity_score(paper,p)[0])
-                                for p in search_db(limit=500) if p["id"]!=pid and compute_similarity_score(paper,p)[0]>=60]
-                        if dups: st.warning(f"{len(dups)} potential dups"); [st.write(f"- {t} ({s:.0f})") for t,s in sorted(dups,key=lambda x:-x[1])[:3]]
-                        else: st.success("No dups")
+                    if st.button("🤖 Check Duplicates", key=f"c_{pid}"):
+                        with st.spinner("Checking..."):
+                            dups = []
+                            for p in search_db(limit=500):
+                                if p["id"] != pid:
+                                    score, _ = compute_similarity_score(paper, p)
+                                    if score >= 60:
+                                        dups.append((decode_latex(p["title"][:40]), score))
+                            if dups:
+                                st.warning(f"Found {len(dups)} potential duplicate(s):")
+                                for t, s in sorted(dups, key=lambda x:-x[1])[:3]:
+                                    st.write(f"• {t}... ({s:.0f}%)")
+                            else:
+                                st.success("No duplicates found")
                 with b3:
-                    if st.button("🗑️ Del", key=f"x_{pid}"):
+                    if st.button("📋 View BibTeX", key=f"b_{pid}"):
+                        bibtex = paper.get("bibtex") or format_bibtex_entry(
+                            paper, paper.get("citation_key") or generate_citation_key(paper["authors"], paper["year"]),
+                            paper.get("abbr", "Article"), paper.get("doi", ""))
+                        st.code(bibtex, language="bibtex")
+                with b4:
+                    if st.button("🗑️ Delete", key=f"x_{pid}"):
                         delete_from_db(pid); st.session_state.db_sel.discard(pid); st.rerun()
 
     # ============ SYNC PAPERS PAGE ============
