@@ -443,7 +443,9 @@ def compute_similarity_score(pub: dict, existing: dict) -> tuple[float, str]:
 
 def find_missing_papers(scholar_pubs: list[dict], existing_entries: list[dict],
                         lm_studio_url: str = "http://localhost:1234/v1",
-                        use_ai_disambiguation: bool = True) -> list[dict]:
+                        use_ai_disambiguation: bool = True,
+                        match_threshold: int = 85,
+                        uncertain_threshold: int = 60) -> list[dict]:
     """Find papers in Scholar that are not in existing BibTeX using advanced matching."""
     missing = []
     uncertain = []  # Papers that need AI disambiguation
@@ -460,11 +462,11 @@ def find_missing_papers(scholar_pubs: list[dict], existing_entries: list[dict],
                 best_match = existing
                 best_reason = reason
 
-        # Decision thresholds
-        if best_score >= 85:
+        # Decision thresholds (configurable)
+        if best_score >= match_threshold:
             # High confidence match - skip this paper
             continue
-        elif best_score >= 60 and use_ai_disambiguation:
+        elif best_score >= uncertain_threshold and use_ai_disambiguation:
             # Uncertain - queue for AI disambiguation
             uncertain.append((pub, best_match, best_score, best_reason))
         else:
@@ -778,6 +780,30 @@ def main():
         )
 
         st.divider()
+        st.subheader("Duplicate Detection")
+
+        match_threshold = st.slider(
+            "Match threshold",
+            50, 100, 85,
+            help="Score ≥ this = confident match (skip paper)"
+        )
+        st.session_state.match_threshold = match_threshold
+
+        uncertain_threshold = st.slider(
+            "Uncertain threshold",
+            30, 80, 60,
+            help="Score between this and match threshold = ask AI"
+        )
+        st.session_state.uncertain_threshold = uncertain_threshold
+
+        use_ai_disambiguation = st.toggle(
+            "Use AI for uncertain matches",
+            value=st.session_state.get("use_ai_disambiguation", True),
+            help="Use LLM to disambiguate papers with uncertain similarity"
+        )
+        st.session_state.use_ai_disambiguation = use_ai_disambiguation
+
+        st.divider()
         st.subheader("DOI Lookup")
 
         doi_lookup_enabled = st.toggle(
@@ -848,7 +874,10 @@ def main():
                                 st.session_state.missing_papers = find_missing_papers(
                                     st.session_state.scholar_pubs,
                                     st.session_state.existing_entries,
-                                    lm_studio_url
+                                    lm_studio_url,
+                                    st.session_state.get("use_ai_disambiguation", True),
+                                    st.session_state.get("match_threshold", 85),
+                                    st.session_state.get("uncertain_threshold", 60)
                                 )
                             st.session_state.step = 2
                             st.rerun()
@@ -886,7 +915,10 @@ def main():
                                     st.session_state.missing_papers = find_missing_papers(
                                         st.session_state.scholar_pubs,
                                         st.session_state.existing_entries,
-                                        lm_studio_url
+                                        lm_studio_url,
+                                        st.session_state.get("use_ai_disambiguation", True),
+                                        st.session_state.get("match_threshold", 85),
+                                        st.session_state.get("uncertain_threshold", 60)
                                     )
                                 st.session_state.step = 2
                                 st.rerun()
@@ -922,7 +954,10 @@ def main():
                             st.session_state.missing_papers = find_missing_papers(
                                 st.session_state.scholar_pubs,
                                 st.session_state.existing_entries,
-                                lm_studio_url
+                                lm_studio_url,
+                                st.session_state.get("use_ai_disambiguation", True),
+                                st.session_state.get("match_threshold", 85),
+                                st.session_state.get("uncertain_threshold", 60)
                             )
                         st.session_state.step = 2
                         st.rerun()
@@ -948,7 +983,10 @@ def main():
                         st.session_state.missing_papers = find_missing_papers(
                             st.session_state.scholar_pubs,
                             st.session_state.existing_entries,
-                            lm_studio_url
+                            lm_studio_url,
+                            st.session_state.get("use_ai_disambiguation", True),
+                            st.session_state.get("match_threshold", 85),
+                            st.session_state.get("uncertain_threshold", 60)
                         )
                     st.session_state.step = 2
                     st.rerun()
@@ -975,7 +1013,10 @@ def main():
                         st.session_state.missing_papers = find_missing_papers(
                             st.session_state.scholar_pubs,
                             st.session_state.existing_entries,
-                            lm_studio_url
+                            lm_studio_url,
+                            st.session_state.get("use_ai_disambiguation", True),
+                            st.session_state.get("match_threshold", 85),
+                            st.session_state.get("uncertain_threshold", 60)
                         )
                     st.session_state.step = 2
                     st.rerun()
@@ -1002,7 +1043,10 @@ def main():
                         st.session_state.missing_papers = find_missing_papers(
                             st.session_state.scholar_pubs,
                             st.session_state.existing_entries,
-                            lm_studio_url
+                            lm_studio_url,
+                            st.session_state.get("use_ai_disambiguation", True),
+                            st.session_state.get("match_threshold", 85),
+                            st.session_state.get("uncertain_threshold", 60)
                         )
                     st.session_state.step = 2
                     st.rerun()
